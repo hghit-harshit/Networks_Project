@@ -27,6 +27,7 @@ from mininet.log import setLogLevel, info
 from mininet.link import TCLink
 import time
 import os
+import pareto_flow  # Ensure pareto_flow.py is in the same directory or in PYTHONPATH
 
 
 def setup_qdisc(net):
@@ -75,7 +76,7 @@ def setup_qdisc(net):
     info(f'*** Installing CAKE on {r1_r2_intf} (100 Mbps)\n')
     out = r1.cmd(
         f'tc qdisc replace dev {r1_r2_intf} '
-        f'root cake bandwidth 100mbit diffserv3 dual-srchost'
+        f'root cake bandwidth 100mbit diffserv3 '#dual-srchost'
         f' 2>&1'
     )
 
