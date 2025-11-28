@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-FAN Controller (ports-aware) - drop-in replacement
+Classic FAN Controller (Option B - Basic FAN with MBAC)
 
-Uses 5-tuple flow keys (dpid, src_ip, dst_ip, proto, src_port, dst_port)
-so each TCP/UDP connection is a separate flow for MBAC / RAMAF.
+- Streaming (UDP) flows: always admitted (priority)
+- Elastic (TCP) flows:
+    * If flow_id in PFL: always forwarded
+    * Else if link congested: dropped
+    * Else (not congested): flow_id added to PFL and forwarded
+
+- Congestion condition:
+    fair_rate < MIN_FAIR_RATE OR priority_load > MAX_PRIORITY_LOAD
+
+Keeps:
+- Same logging style (fan_controller.log, fair_raw.log)
+- ARP handling
+- Basic routing
 """
-
-# TODO: 
-# implement ramaf
-# remove 1 flow in analysize stats 
-# readmission policy is 
-# if no congestion -> remove fifo from pafl
- 
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
@@ -23,37 +27,24 @@ import time
 from collections import defaultdict
 import logging
 
+
 class FANController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
         super(FANController, self).__init__(*args, **kwargs)
 
-        
-        self.logger_ramaf = logging.getLogger("ramaf")
-        self.logger_ramaf.setLevel(logging.INFO)
-        
-        fh_ramaf = logging.FileHandler("ramaf.log", mode="a")
-        fh_ramaf.setLevel(logging.INFO)
-        ramaf_formatter = logging.Formatter("%(asctime)s - %(message)s")
-        fh_ramaf.setFormatter(ramaf_formatter)
-        self.logger_ramaf.addHandler(fh_ramaf)
-        
-        #self.logger_ramaf.info("does this even work")
-        # FAIR-RAW dedicated logger
-        
+        # ---------- Logging setup ----------
+        # Fair-rate raw log (for plotting later)
         self.fair_logger = logging.getLogger("fair_raw")
         self.fair_logger.setLevel(logging.INFO)
-
-        fh_fair = logging.FileHandler("fair_raw.log", mode="a")
+        fh_fair = logging.FileHandler("normal_fair_raw.log", mode="a")
         fh_fair.setLevel(logging.INFO)
-
         fair_formatter = logging.Formatter("%(asctime)s - %(message)s")
         fh_fair.setFormatter(fair_formatter)
-
         self.fair_logger.addHandler(fh_fair)
 
-        # Setup logging to file
+        # Main FAN controller log
         fh = logging.FileHandler("fan_controller.log", mode="a")
         fh.setLevel(logging.INFO)
         formatter = logging.Formatter(
@@ -61,8 +52,8 @@ class FANController(app_manager.RyuApp):
         )
         fh.setFormatter(formatter)
         self.logger.addHandler(fh)
-        
-        # Router configuration
+
+        # ---------- Router configuration (IPs, MACs, routing) ----------
         self.router_interfaces = {
             1: {  # R1
                 1: ("10.0.1.1", "aa:bb:cc:dd:01:01", "10.0.1.0/24"),
@@ -98,44 +89,42 @@ class FANController(app_manager.RyuApp):
                 "10.0.4.0/24": (1, "10.0.5.1"),
             }
         }
-        
-        #self.routing_table = {}
 
-        # L2/L3 helpers
-        self.arp_table = {}
-        self.pending_packets = {}
-        self.arp_requests = {}
+        # ---------- L2/L3 helper tables ----------
+        self.arp_table = {}          # per-dpid: ip -> mac
+        self.pending_packets = {}    # per-dpid: dst_ip -> list(...)
+        self.arp_requests = {}       # per-dpid: dst_ip -> last_req_time
 
-        # FAN-specific state
-        self.pfl = set()                           # Protected Flow List (flow_keys)
-        self.pafl = []                             # PAFL queue (evicted flows)
-        self.admitted_flows_number = defaultdict(int)  # per-src-ip admitted count
-        self.is_congested = False
-        self.fair_rate = 0
-        self.flow_stats = {}   # keyed by full flow_key (dpid,src,dst,proto,sp,dp)
-        self.prev_flow_stats = {}
+        # ---------- FAN state (BASIC / OPTION B) ----------
+        self.pfl = set()        # Protected Flow List (flow_keys)
+        self.flow_stats = {}    # current flow stats from switch
+        self.prev_flow_stats = {}  # snapshot from previous interval
         self.datapaths = {}
-        self.BOTTLENECK_BW = 100 * 1000000 / 8  # bytes per second (100 Mbps)
-        self.LINK_CAP_BITS = self.BOTTLENECK_BW * 8 # bits/sec
-        self.alpha = 0.1                              # smoothing factor
-        self.MIN_FAIR_RATE = 0.05 * self.LINK_CAP_BITS  # 5% capacity
-        self.MAX_PRIORITY_LOAD = 0.70                  # 70% load
-        self.fair_rate = self.BOTTLENECK_BW            # initialize
+
+        # Link capacity assumptions (bottleneck link)
+        self.BOTTLENECK_BW = 100 * 1000000 / 8.0  # bytes/sec (100 Mbps)
+        self.LINK_CAP_BITS = self.BOTTLENECK_BW * 8.0  # bits/sec
+
+        # Smoothing for fair-rate (alpha close to 1 => smoother)
+        self.alpha = 0.1
+        self.MIN_FAIR_RATE = 0.05 * self.BOTTLENECK_BW * 8.0  # bits/sec (5% of capacity)
+        self.MAX_PRIORITY_LOAD = 0.70  # 70% of link used by streaming
+        self.fair_rate = self.LINK_CAP_BITS
+        self.is_congested = False
+
         self.last_fair_calc_time = time.time()
-        self.last_priority_calc_time = time.time()
-        # Configuration
+
+        # Config
         self.MONITOR_INTERVAL = 1.0
         self.IDLE_TIMEOUT = 60
         self.HARD_TIMEOUT = 0
-        self.MAX_FLOWS_PER_USER = 2
-        self.CONGESTION_THRESHOLD = 1.10
-        self.EVICTION_MARGIN = 1.20
-        self.BOTTLENECK_DPID = 1  # R1 enforces admission
+        self.BOTTLENECK_DPID = 1  # admission enforced at R1
 
         self.logger.info("=" * 70)
-        self.logger.info("FAN Controller (ports-aware) Initialized")
+        self.logger.info("Classic FAN Controller (Option B) Initialized")
         self.logger.info("=" * 70)
 
+        # Start periodic monitoring
         self.monitor_thread = hub.spawn(self._monitor)
 
     # ----------------- Switch connection / table-miss -----------------
@@ -160,18 +149,11 @@ class FANController(app_manager.RyuApp):
             self.logger.info(f"[DPID {dpid}] Router interfaces:")
             for port, (ip, mac, net) in self.router_interfaces[dpid].items():
                 self.logger.info(f"  Port {port}: {ip} ({mac}) - Network {net}")
-        
 
-         #ADD ARP RULE HERE
-        # arp_match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_ARP)
-        # arp_actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
-        #                                     ofproto.OFPCML_NO_BUFFER)]
-        # self.add_flow(datapath,10, arp_match, arp_actions)
-
-        # EXISTING TABLE-MISS RULE
+        # Table-miss rule: send all unmatched packets to controller
         match = parser.OFPMatch()
-        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
-                                        ofproto.OFPCML_NO_BUFFER)]
+        actions = [parser.OFPActionOutput(
+            ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions)
 
     # ----------------- Packet-in handler -----------------
@@ -179,7 +161,6 @@ class FANController(app_manager.RyuApp):
     def _packet_in_handler(self, ev):
         msg = ev.msg
         datapath = msg.datapath
-        dpid = datapath.id
         in_port = msg.match['in_port']
 
         pkt = packet.Packet(msg.data)
@@ -187,14 +168,15 @@ class FANController(app_manager.RyuApp):
         if not eth:
             return
 
-        if eth.ethertype == ether_types.ETH_TYPE_IPV6 or eth.ethertype == ether_types.ETH_TYPE_LLDP:
+        # Ignore IPv6 & LLDP
+        if eth.ethertype in (ether_types.ETH_TYPE_IPV6, ether_types.ETH_TYPE_LLDP):
             return
 
         if eth.ethertype == ether_types.ETH_TYPE_ARP:
             self.logger.info("= *" * 10 + "\nARP Packet Received\n" + "= *" * 10)
             self._handle_arp(datapath, pkt, eth, in_port)
             return
-    
+
         if eth.ethertype == ether_types.ETH_TYPE_IP:
             self.logger.info("= *" * 10 + "\nIPv4 Packet Received\n" + "= *" * 10)
             self._handle_ipv4_with_mbac(datapath, pkt, eth, in_port)
@@ -204,14 +186,23 @@ class FANController(app_manager.RyuApp):
     def _handle_arp(self, datapath, pkt, eth, in_port):
         dpid = datapath.id
         arp_pkt = pkt.get_protocol(arp.arp)
-        self.logger.info(f"[DPID {dpid}] Handling ARP packet: opcode={arp_pkt.opcode} src_ip={arp_pkt.src_ip} dst_ip={arp_pkt.dst_ip}")
         if not arp_pkt:
             return
+
+        self.logger.info(
+            f"[DPID {dpid}] Handling ARP packet: opcode={arp_pkt.opcode} "
+            f"src_ip={arp_pkt.src_ip} dst_ip={arp_pkt.dst_ip}"
+        )
+
+        # Learn source IP->MAC
         self.arp_table[dpid][arp_pkt.src_ip] = arp_pkt.src_mac
-        self.logger.info(f"[DPID {dpid}] ARP learned: {arp_pkt.src_ip} -> {arp_pkt.src_mac}")
+        self.logger.info(
+            f"[DPID {dpid}] ARP learned: {arp_pkt.src_ip} -> {arp_pkt.src_mac}"
+        )
         self._process_pending_packets(datapath, arp_pkt.src_ip)
 
         if arp_pkt.opcode == arp.ARP_REQUEST:
+            # If target IP is one of our router interfaces, answer
             if dpid in self.router_interfaces:
                 for port, (ip, mac, net) in self.router_interfaces[dpid].items():
                     if arp_pkt.dst_ip == ip:
@@ -219,7 +210,9 @@ class FANController(app_manager.RyuApp):
                         return
 
         elif arp_pkt.opcode == arp.ARP_REPLY:
-            self.logger.info(f"[DPID {dpid}] ARP reply: {arp_pkt.src_ip} is at {arp_pkt.src_mac}")
+            self.logger.info(
+                f"[DPID {dpid}] ARP reply: {arp_pkt.src_ip} is at {arp_pkt.src_mac}"
+            )
 
     def _send_arp_reply(self, datapath, arp_req, src_mac, out_port):
         ofproto = datapath.ofproto
@@ -281,7 +274,7 @@ class FANController(app_manager.RyuApp):
         datapath.send_msg(out)
         self.arp_requests[dpid][dst_ip] = time.time()
 
-    # ----------------- IPv4 + MBAC -----------------
+    # ----------------- IPv4 + BASIC FAN MBAC -----------------
     def _handle_ipv4_with_mbac(self, datapath, pkt, eth, in_port):
         dpid = datapath.id
         ipv4_pkt = pkt.get_protocol(ipv4.ipv4)
@@ -292,7 +285,7 @@ class FANController(app_manager.RyuApp):
         dst_ip = ipv4_pkt.dst
         proto = ipv4_pkt.proto
 
-        # Router interface check (ICMP to router)
+        # If packet is destined to router IP (ICMP echo to router), reply
         if dpid in self.router_interfaces:
             for port, (ip, mac, net) in self.router_interfaces[dpid].items():
                 if dst_ip == ip:
@@ -301,73 +294,79 @@ class FANController(app_manager.RyuApp):
                         self._send_icmp_reply(datapath, pkt, eth, ipv4_pkt, icmp_pkt, in_port)
                     return
 
-        # ICMP: forward normally (do not MBAC)
+        # ICMP: just route (no MBAC)
         icmp_pkt = pkt.get_protocol(icmp.icmp)
         if icmp_pkt:
             self._route_packet(datapath, pkt, eth, ipv4_pkt, in_port)
             return
 
-        # Extract transport ports (if any)
+        # Extract transport ports
         tcp_pkt = pkt.get_protocol(tcp.tcp)
         udp_pkt = pkt.get_protocol(udp.udp)
 
-        # TODO: make voice over ip is_streaming=True handle that for 
         if tcp_pkt:
             src_port = tcp_pkt.src_port
             dst_port = tcp_pkt.dst_port
-            is_streaming = False
+            is_streaming = False   # TCP = elastic
         elif udp_pkt:
             src_port = udp_pkt.src_port
             dst_port = udp_pkt.dst_port
-            is_streaming = True
+            is_streaming = True    # UDP = streaming
         else:
-            # Non-TCP/UDP: just route by L3
+            # Non-TCP/UDP traffic: route as pure L3
             self._route_packet(datapath, pkt, eth, ipv4_pkt, in_port)
             return
 
-        # Build 5-tuple flow_key
         flow_key = (dpid, src_ip, dst_ip, proto, src_port, dst_port)
+        self.logger.info(
+            f"[DPID {dpid}] Flow: {src_ip}:{src_port} -> {dst_ip}:{dst_port} proto={proto}"
+        )
 
-        self.logger.info(f"[DPID {dpid}] Flow: {src_ip}:{src_port} -> {dst_ip}:{dst_port} proto={proto}")
-
-        # Non-bottleneck routers just forward (no admission)
+        # Non-bottleneck routers: plain routing, no MBAC
         if dpid != self.BOTTLENECK_DPID:
-            self._route_and_install_flow(datapath, pkt, eth, ipv4_pkt, in_port, flow_key, is_elastic=not is_streaming)
+            self._route_and_install(
+                datapath, pkt, eth, ipv4_pkt, in_port, flow_key,
+                is_elastic=not is_streaming
+            )
             return
 
-        # Streaming (UDP) flows: accept immediately (protected)
+        # ---------- BASIC FAN POLICY (OPTION B) ----------
+
+        # 1) Streaming (UDP) flows: always admitted, protected
         if is_streaming:
-            self.logger.info(f"[DPID {dpid}] UDP streaming -> accept and install")
-            # Add to PFL (protected) to ensure queue assignment if needed
-            self.pfl.add(flow_key)
-            self._route_and_install_flow(datapath, pkt, eth, ipv4_pkt, in_port, flow_key, is_elastic=False)
+            self.logger.info(f"[DPID {dpid}] UDP streaming -> ALWAYS ACCEPT")
+            self.pfl.add(flow_key)  # treat as protected flow
+            self._route_and_install(
+                datapath, pkt, eth, ipv4_pkt, in_port, flow_key, is_elastic=False
+            )
             return
 
-        # Elastic (TCP) flows: MBAC
+        # 2) Elastic (TCP) flows:
+        # If flow already in PFL: always forwarded, regardless of congestion
         if flow_key in self.pfl:
-            self.logger.debug(f"[DPID {dpid}] Flow in PFL -> Accept")
-            self._route_and_install_flow(datapath, pkt, eth, ipv4_pkt, in_port, flow_key, is_elastic=True)
+            self.logger.info(f"[DPID {dpid}] TCP elastic in PFL -> ACCEPT")
+            self._route_and_install(
+                datapath, pkt, eth, ipv4_pkt, in_port, flow_key, is_elastic=True
+            )
             return
 
+        # New elastic flow (flow_key not in PFL):
+        # If congested -> DROP
         if self.is_congested:
-            self.logger.info(f"[DPID {dpid}] CONGESTED and flow not in PFL -> DROP {flow_key}")
+            self.logger.info(
+                f"[DPID {dpid}] CONGESTED and new elastic flow {flow_key} -> DROP"
+            )
             return
 
-
-        # Per-user admission count (user = src_ip)
-        if self.admitted_flows_number[src_ip] >= self.MAX_FLOWS_PER_USER:
-            self.logger.info(f"[DPID {dpid}] User {src_ip} exceeded max flows ({self.admitted_flows_number[src_ip]}/{self.MAX_FLOWS_PER_USER}) -> DROP")
-            return
-
-        # Admit new elastic flow
+        # Not congested -> ADMIT: add to PFL and install
         self.logger.info(f"[DPID {dpid}] Admitting new elastic flow {flow_key}")
         self.pfl.add(flow_key)
-        self.admitted_flows_number[src_ip] += 1
-        self._route_and_install_flow(datapath, pkt, eth, ipv4_pkt, in_port, flow_key, is_elastic=True)
+        self._route_and_install(
+            datapath, pkt, eth, ipv4_pkt, in_port, flow_key, is_elastic=True
+        )
 
-    # ----------------- Routing / forwarding -----------------
-    def _route_and_install_flow(self, datapath, pkt, eth, ipv4_pkt, in_port, flow_key, is_elastic):
-        """Route packet and install flow (handles ARP)"""
+    # ----------------- Routing / forwarding helpers -----------------
+    def _route_and_install(self, datapath, pkt, eth, ipv4_pkt, in_port, flow_key, is_elastic):
         dpid = datapath.id
         dst_ip = ipv4_pkt.dst
 
@@ -386,21 +385,24 @@ class FANController(app_manager.RyuApp):
         src_mac = self.router_interfaces[dpid][out_port][1]
         src_ip_router = self.router_interfaces[dpid][out_port][0]
 
+        # ARP resolved?
         if next_hop_ip in self.arp_table[dpid]:
             dst_mac = self.arp_table[dpid][next_hop_ip]
             self._forward_and_install(datapath, pkt, in_port, out_port, src_mac, dst_mac, flow_key)
         else:
-            # queue until ARP resolution; include flow_key so we can install correct match later
+            # Queue packet until ARP resolution
             if next_hop_ip not in self.pending_packets[dpid]:
                 self.pending_packets[dpid][next_hop_ip] = []
-            self.pending_packets[dpid][next_hop_ip].append((pkt, in_port, out_port, flow_key))
+            self.pending_packets[dpid][next_hop_ip].append(
+                (pkt, in_port, out_port, flow_key)
+            )
 
-            if next_hop_ip not in self.arp_requests[dpid] or \
-               time.time() - self.arp_requests[dpid][next_hop_ip] > 1.0:
+            if (next_hop_ip not in self.arp_requests[dpid] or
+                    time.time() - self.arp_requests[dpid][next_hop_ip] > 1.0):
                 self._send_arp_request(datapath, src_ip_router, src_mac, next_hop_ip, out_port)
 
     def _route_packet(self, datapath, pkt, eth, ipv4_pkt, in_port):
-        """Simple routing with a short-lived flow for ICMP"""
+        """Routing for control/ICMP traffic – installs short-lived flow."""
         dpid = datapath.id
         src_ip = ipv4_pkt.src
         dst_ip = ipv4_pkt.dst
@@ -439,20 +441,19 @@ class FANController(app_manager.RyuApp):
             if next_hop_ip not in self.pending_packets[dpid]:
                 self.pending_packets[dpid][next_hop_ip] = []
             self.pending_packets[dpid][next_hop_ip].append((pkt, in_port, out_port))
-            if next_hop_ip not in self.arp_requests[dpid] or \
-               time.time() - self.arp_requests[dpid][next_hop_ip] > 1.0:
+            if (next_hop_ip not in self.arp_requests[dpid] or
+                    time.time() - self.arp_requests[dpid][next_hop_ip] > 1.0):
                 self._send_arp_request(datapath, src_ip_router, src_mac, next_hop_ip, out_port)
 
     def _forward_and_install(self, datapath, pkt, in_port, out_port, src_mac, dst_mac, flow_key):
-        """Forward packet and install a flow that MATCHES ports when available"""
+        """Forward packet and install a flow (matches 5-tuple when possible)."""
         dpid = datapath.id
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-        # Unpack flow_key: (dpid, src_ip, dst_ip, proto, src_port, dst_port)
         _, src_ip, dst_ip, proto, src_port, dst_port = flow_key
 
-        # Build OFPMatch including transport ports when present
+        # Match on L3+L4 when possible
         if proto == 6:  # TCP
             match = parser.OFPMatch(
                 eth_type=ether_types.ETH_TYPE_IP,
@@ -472,7 +473,6 @@ class FANController(app_manager.RyuApp):
                 udp_dst=dst_port
             )
         else:
-            # Fallback to L3 match
             match = parser.OFPMatch(
                 eth_type=ether_types.ETH_TYPE_IP,
                 ipv4_src=src_ip,
@@ -480,27 +480,11 @@ class FANController(app_manager.RyuApp):
                 ip_proto=proto
             )
 
-        # Queue assignment logic:
-        # - At bottleneck router (DPID 1), admitted elastic flows -> queue 1 (lower priority)
-        # - Streaming (UDP) flows (we put them in PFL earlier) -> queue 0 (protected)
-        queue_id = 0
-        if dpid == self.BOTTLENECK_DPID:
-            if flow_key in self.pfl:
-                # if flow is protected but elastic, we send to queue 1 (elastic admitted)
-                # streaming flows have been added to PFL and should be considered protected.
-                # choose queue for elastic admitted flows as 1, streaming as 0
-                # Determine streaming vs elastic by proto (UDP treated streaming earlier)
-                if proto == 6:
-                    # TCP admitted -> elastic queue (1)
-                    queue_id = 1
-                else:
-                    # UDP -> protected queue (0)
-                    queue_id = 0
-
+        # DSCP marking: elastic vs streaming (optional, for queues)
         if proto == 6:
-            dscp_value = 0
+            dscp_value = 0      # elastic
         else:
-            dscp_value = 46
+            dscp_value = 46     # streaming, higher priority
 
         actions = [
             parser.OFPActionSetField(ip_dscp=dscp_value),
@@ -509,14 +493,19 @@ class FANController(app_manager.RyuApp):
             parser.OFPActionOutput(out_port)
         ]
 
-        # Install the flow
-        self.add_flow(datapath, 10, match, actions,
-                      idle_timeout=self.IDLE_TIMEOUT,
-                      hard_timeout=self.HARD_TIMEOUT)
+        # Install flow
+        self.add_flow(
+            datapath, 10, match, actions,
+            idle_timeout=self.IDLE_TIMEOUT,
+            hard_timeout=self.HARD_TIMEOUT
+        )
 
-        self.logger.info(f"[DPID {dpid}] Flow installed: {src_ip}:{src_port} -> {dst_ip}:{dst_port} proto={proto} queue={queue_id} out_port={out_port}")
+        self.logger.info(
+            f"[DPID {dpid}] Flow installed: {src_ip}:{src_port} -> {dst_ip}:{dst_port} "
+            f"proto={proto} out_port={out_port}"
+        )
 
-        # Forward the triggering packet
+        # Forward the packet that triggered packet-in
         out = parser.OFPPacketOut(
             datapath=datapath,
             buffer_id=ofproto.OFP_NO_BUFFER,
@@ -545,25 +534,36 @@ class FANController(app_manager.RyuApp):
         )
         datapath.send_msg(out)
 
-    # ----------------- Flow add/delete -----------------
+    # ----------------- Flow add helper -----------------
     def add_flow(self, datapath, priority, match, actions, buffer_id=None,
                  idle_timeout=0, hard_timeout=0):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        inst = [parser.OFPInstructionActions(
+            ofproto.OFPIT_APPLY_ACTIONS, actions)]
 
         if buffer_id:
-            mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
-                                   priority=priority, match=match,
-                                   instructions=inst, idle_timeout=idle_timeout,
-                                   hard_timeout=hard_timeout)
+            mod = parser.OFPFlowMod(
+                datapath=datapath,
+                buffer_id=buffer_id,
+                priority=priority,
+                match=match,
+                instructions=inst,
+                idle_timeout=idle_timeout,
+                hard_timeout=hard_timeout
+            )
         else:
-            mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
-                                   match=match, instructions=inst,
-                                   idle_timeout=idle_timeout, hard_timeout=hard_timeout)
+            mod = parser.OFPFlowMod(
+                datapath=datapath,
+                priority=priority,
+                match=match,
+                instructions=inst,
+                idle_timeout=idle_timeout,
+                hard_timeout=hard_timeout
+            )
         datapath.send_msg(mod)
 
-    # ----------------- Monitoring / RAMAF -----------------
+    # ----------------- Monitoring (fair_rate + priority_load) -----------------
     def _monitor(self):
         while True:
             hub.sleep(self.MONITOR_INTERVAL)
@@ -584,7 +584,6 @@ class FANController(app_manager.RyuApp):
 
         for stat in body:
             match = stat.match
-            # require ipv4_src and ipv4_dst for our tracked flows
             if 'ipv4_src' not in match or 'ipv4_dst' not in match:
                 continue
 
@@ -592,7 +591,6 @@ class FANController(app_manager.RyuApp):
             dst_ip = match.get('ipv4_dst')
             proto = match.get('ip_proto', 0)
 
-            # extract transport ports if present
             src_port = match.get('tcp_src') or match.get('udp_src') or 0
             dst_port = match.get('tcp_dst') or match.get('udp_dst') or 0
 
@@ -605,56 +603,59 @@ class FANController(app_manager.RyuApp):
                 'last_seen': time.time()
             }
 
-            # debug print for TCP
             if proto == 6 and stat.byte_count > 0:
-                rate_mbps = (stat.byte_count / stat.duration_sec * 8 / 1000000) if stat.duration_sec > 0 else 0
+                rate_mbps = (
+                    stat.byte_count / stat.duration_sec * 8 / 1_000_000
+                    if stat.duration_sec > 0 else 0
+                )
                 in_pfl = "YES" if flow_key in self.pfl else "NO"
-                self.logger.info(f"[DPID {dpid}] TCP stats: {src_ip}:{src_port}->{dst_ip}:{dst_port} bytes={stat.byte_count} dur={stat.duration_sec:.1f}s rate={rate_mbps:.1f}Mbps inPFL={in_pfl}")
+                self.logger.info(
+                    f"[DPID {dpid}] TCP stats: {src_ip}:{src_port}->{dst_ip}:{dst_port} "
+                    f"bytes={stat.byte_count} dur={stat.duration_sec:.1f}s "
+                    f"rate={rate_mbps:.1f}Mbps inPFL={in_pfl}"
+                )
 
     def _analyze_stats(self):
         """
-        Periodic monitor invoked by monitor thread.
-        - Computes fair_rate using bytes observed during last window.
-        - Detects congestion and runs RAMAF eviction/readmit logic.
-        - Resets per-window admitted_flows_number for next monitoring window.
+        Basic FAN measurement:
+        - Compute fair_rate (bits/sec) from elastic flows
+        - Compute priority_load (fraction of link capacity)
+        - Set self.is_congested accordingly
         """
-
         now = time.time()
-        # If this is the first call, ensure last_fair_calc_time is initialized
+
         if not hasattr(self, 'last_fair_calc_time') or self.last_fair_calc_time is None:
             self.last_fair_calc_time = now - self.MONITOR_INTERVAL
 
-        # If no flow stats are being tracked -> idle link: set fair_rate to link capacity
+        # No flows -> idle link, fair_rate = link capacity, not congested
         if not self.flow_stats:
-            self.fair_rate = self.LINK_CAP_BITS   # LINK_CAP_BITS must be bits/sec
+            self.fair_rate = self.LINK_CAP_BITS
             self.is_congested = False
-            # Reset per-user admitted counter for next window (important)
-            self.admitted_flows_number = defaultdict(int)
             self.last_fair_calc_time = now
-            self.logger.info("[FAIR] no flow_stats -> fair_rate set to link capacity, admitted counters reset")
+            self.logger.info(
+                "[FAIR] no flow_stats -> fair_rate set to link capacity, uncongested"
+            )
             return
 
         interval = now - self.last_fair_calc_time
         if interval <= 0:
             interval = self.MONITOR_INTERVAL
 
-        elastic_bytes = 0           # total bytes sent by admitted elastic flows during interval
-        priority_bytes = 0          # total bytes from streaming (UDP) during interval
+        elastic_bytes = 0
+        priority_bytes = 0
         elastic_flow_keys = set()
 
-        # ----- compute byte_deltas using previous snapshot (prev_flow_stats)
-        # We use prev_flow_stats (populated from the previous monitor run) to compute byte diffs.
+        # GC + compute byte diffs
         for flow_key, stats in list(self.flow_stats.items()):
             dpid, _, _, proto, _, _ = flow_key
 
-            # GC: drop stale stats
+            # Drop stale entries
             if now - stats.get('last_seen', now) > 120:
-                # remove stale entries; prev_flow_stats cleanup will happen when snapshot updated at end
                 self.flow_stats.pop(flow_key, None)
                 self.prev_flow_stats.pop(flow_key, None)
                 continue
 
-            # Only consider flows on the configured bottleneck datapath
+            # Only consider bottleneck router
             if dpid != self.BOTTLENECK_DPID:
                 continue
 
@@ -664,37 +665,28 @@ class FANController(app_manager.RyuApp):
                 if byte_diff < 0:
                     byte_diff = 0
             else:
-                # no previous snapshot for this flow -> treat as zero bytes in this delta
                 byte_diff = 0
 
-            # classify bytes
-            if proto == 17:  # UDP -> streaming/priority
+            if proto == 17:  # UDP (streaming)
                 priority_bytes += byte_diff
-            elif proto == 6 and flow_key in self.pfl:  # TCP and admitted -> elastic
+            elif proto == 6 and flow_key in self.pfl:  # TCP elastic, admitted
                 elastic_bytes += byte_diff
                 elastic_flow_keys.add(flow_key)
 
         num_elastic_flows = len(elastic_flow_keys)
-
-        # Link capacity C in bits/sec (ensure this is bits/sec when you set it)
         C = self.LINK_CAP_BITS
 
-        # ----- FAIR RATE (units-consistent computation)
+        # Fair rate computation (bits/sec)
         if num_elastic_flows > 0:
-            used_bits = float(elastic_bytes) * 8.0              # bits consumed by elastic flows during interval
-            total_bits_available = float(C) * interval         # bits available on link during interval
-            idle_bits = max(total_bits_available - used_bits, 0.0)  # bits unused during this interval
+            used_bits = float(elastic_bytes) * 8.0
+            total_bits_available = float(C) * interval
+            idle_bits = max(total_bits_available - used_bits, 0.0)
 
-            # bytes per elastic flow during interval
-            FB = float(elastic_bytes) / float(num_elastic_flows)
-
-            # bits candidate during interval: either idle bits (spare capacity in interval) OR per-flow bits
+            FB = float(elastic_bytes) / float(num_elastic_flows)  # bytes/flow in interval
             bits_candidate = max(idle_bits, FB * 8.0)
 
-            # measured fair rate in bits/sec = bits_candidate (bits in interval) / interval (seconds)
             measured_fair_rate = bits_candidate / interval if interval > 0 else 0.0
 
-            # logging with helpful fields
             self.fair_logger.info(
                 f"[FAIR-RAW] interval={interval:.3f}s "
                 f"elastic_bytes={elastic_bytes}B priority_bytes={priority_bytes}B "
@@ -702,247 +694,46 @@ class FANController(app_manager.RyuApp):
                 f"FB={FB:.1f}B measured_fair_rate={measured_fair_rate/1e6:.3f}Mb/s"
             )
 
-            # Exponential smoothing (alpha in [0,1], smaller -> smoother)
-            # Initialize self.fair_rate if not present
-            if not hasattr(self, 'fair_rate') or self.fair_rate is None:
+            if self.fair_rate is None:
                 self.fair_rate = measured_fair_rate
             else:
-                self.fair_rate = self.alpha * self.fair_rate + (1.0 - self.alpha) * measured_fair_rate
+                # Exponential smoothing
+                self.fair_rate = (
+                    self.alpha * self.fair_rate +
+                    (1.0 - self.alpha) * measured_fair_rate
+                )
         else:
-            # No elastic flows -> fair_rate = full capacity (bits/sec)
+            # No elastic flows -> fair_rate = full capacity
             self.fair_rate = float(C)
 
-        # ----- Priority load (fraction of capacity used by streaming traffic)
+        # Priority load (fraction of capacity used by streaming flows)
         if interval > 0 and C > 0:
             priority_load = (priority_bytes * 8.0) / (C * interval)
         else:
             priority_load = 0.0
         priority_load = min(max(priority_load, 0.0), 1.0)
 
-        # Congestion rule from the paper
-        self.is_congested = (self.fair_rate < self.MIN_FAIR_RATE) or (priority_load > self.MAX_PRIORITY_LOAD)
+        # Congestion rule (classic FAN)
+        self.is_congested = (
+            self.fair_rate < self.MIN_FAIR_RATE or
+            priority_load > self.MAX_PRIORITY_LOAD
+        )
 
-        # ----- RAMAF eviction when congested
-        if self.is_congested:
-            evicted_count = 0
-            self.logger_ramaf.info(f"[RAMAF] Congested: fair_rate={self.fair_rate/1e6:.2f}Mbps priority_load={priority_load:.2f}")
-            # iterate over the elastic flows we considered earlier and evict those exceeding threshold
-            for flow_key in list(elastic_flow_keys):
-                stats = self.flow_stats.get(flow_key)
-                prev = self.prev_flow_stats.get(flow_key)
-                if not stats or not prev:
-                    continue
-
-                byte_diff = stats['byte_count'] - prev.get('byte_count', 0)
-                if byte_diff < 0:
-                    byte_diff = 0
-
-                rate_bps = (byte_diff * 8.0) / interval if interval > 0 else 0.0
-
-                # eviction threshold: rate > EVICTION_MARGIN * fair_rate
-                if rate_bps > self.EVICTION_MARGIN * self.fair_rate:
-                    self.logger_ramaf.info(
-                        f"[RAMAF] Evicting {flow_key} rate={rate_bps/1e6:.2f}Mbps "
-                        f"(> {self.EVICTION_MARGIN*self.fair_rate/1e6:.2f}Mbps)"
-                    )
-
-                    # remove from PFL and push to PAFL
-                    self.pfl.discard(flow_key)
-                    if flow_key not in self.pafl:
-                        self.pafl.append(flow_key)
-
-                    # delete flow entry from datapath
-                    self._delete_flow(flow_key)
-
-                    # decrement admitted count if appropriate (guard existence)
-                    _, sip, _, proto, _, _ = flow_key
-                    if proto == 6 and sip in self.admitted_flows_number and self.admitted_flows_number[sip] > 0:
-                        self.admitted_flows_number[sip] -= 1
-
-                    # optionally remove stats so we don't reconsider immediately
-                    self.flow_stats.pop(flow_key, None)
-                    self.prev_flow_stats.pop(flow_key, None)
-
-                    evicted_count += 1
-
-            self.logger_ramaf.info(f"[RAMAF] Congested -> evicted {evicted_count} flows")
-        else:
-            # ----- RE-ADMIT when not congested
-            if len(self.pafl) > 0:
-                readmit_flow = self.pafl.pop(0)
-                self.pfl.add(readmit_flow)
-
-                dpid, sip, dip, proto, sp, dp = readmit_flow
-                if proto == 6:
-                    # increment admitted flows counter for the current window (so it counts toward this window's quota)
-                    self.admitted_flows_number[sip] += 1
-
-                # reinstall flow on switch so packets are forwarded immediately
-                try:
-                    self._reinstall_flow(readmit_flow)
-                except Exception as e:
-                    self.logger.exception(f"[RAMAF] Error reinstalling flow {readmit_flow}: {e}")
-
-                self.logger_ramaf.info(f"[RAMAF] Network healthy -> re-admitted flow {readmit_flow}")
-
-        # ----- Snapshot current stats for next interval (must happen AFTER eviction/readmit)
-        # Keep a shallow copy of counters/metadata used in the next window's delta computation.
+        # Snapshot current stats for next interval
         try:
             self.prev_flow_stats = {k: v.copy() for k, v in self.flow_stats.items()}
         except Exception:
-            # defensive fallback
             self.prev_flow_stats = dict(self.flow_stats)
 
         self.last_fair_calc_time = now
 
-        # ----- Reset admitted counters for next window (paper semantics)
-        self.admitted_flows_number = defaultdict(int)
-
-        # final logging
-        # self.logger.info(
-        #     f"[FAN] fair_rate={self.fair_rate/1e6:.3f}Mbps "
-        #     f"elastic_flows={num_elastic_flows} "
-        #     f"priority_load={priority_load*100:.1f}% "
-        #     f"congested={self.is_congested} "
-        #     f"PFL={len(self.pfl)} PAFL={len(self.pafl)}"
-        # )
-        
-        
-
-    def _reinstall_flow(self, flow_key):
-        dpid, src_ip, dst_ip, proto, sp, dp = flow_key
-
-        if dpid not in self.datapaths:
-            return
-
-        datapath = self.datapaths[dpid]
-        parser = datapath.ofproto_parser
-        ofproto = datapath.ofproto
-
-        # Decide queue based on elastic/priority logic
-        if proto == 6:
-            queue_id = 1   # elastic
-        else:
-            queue_id = 0   # streaming
-
-        # Find route to dst_ip
-        route = self._find_route(dpid, dst_ip)
-        if not route:
-            self.logger.warning(f"[RAMAF] No route found while reinstalling {flow_key}")
-            return
-
-        out_port, next_hop = route
-        next_hop_ip = next_hop if next_hop else dst_ip
-
-        # Router MAC (source MAC)
-        src_mac = self.router_interfaces[dpid][out_port][1]
-
-        # ARP resolved?
-        if next_hop_ip not in self.arp_table[dpid]:
-            # trigger ARP and wait for packet-in to install actual flow
-            src_ip_router = self.router_interfaces[dpid][out_port][0]
-            self._send_arp_request(datapath, src_ip_router, src_mac, next_hop_ip, out_port)
-            self.logger.info(f"[RAMAF] ARP unresolved, queued flow_key {flow_key}")
-            return
-
-        dst_mac = self.arp_table[dpid][next_hop_ip]
-
-        # Build match
-        if proto == 6:
-            match = parser.OFPMatch(
-                eth_type=0x0800,
-                ipv4_src=src_ip,
-                ipv4_dst=dst_ip,
-                ip_proto=6,
-                tcp_src=sp,
-                tcp_dst=dp
-            )
-        elif proto == 17:
-            match = parser.OFPMatch(
-                eth_type=0x0800,
-                ipv4_src=src_ip,
-                ipv4_dst=dst_ip,
-                ip_proto=17,
-                udp_src=sp,
-                udp_dst=dp
-            )
-        else:
-            match = parser.OFPMatch(
-                eth_type=0x0800,
-                ipv4_src=src_ip,
-                ipv4_dst=dst_ip,
-                ip_proto=proto
-            )
-
-        if proto == 6:
-            dscp_value = 0
-        else:
-            dscp_value = 46
-
-        actions = [
-            parser.OFPActionSetField(ip_dscp=dscp_value),
-            parser.OFPActionSetField(eth_src=src_mac),
-            parser.OFPActionSetField(eth_dst=dst_mac),
-            parser.OFPActionOutput(out_port)
-        ]
-
-        mod = parser.OFPFlowMod(
-            datapath=datapath,
-            priority=10,
-            match=match,
-            instructions=[parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)],
-            idle_timeout=self.IDLE_TIMEOUT,
-            hard_timeout=self.HARD_TIMEOUT
+        self.logger.info(
+            f"[FAN] fair_rate={self.fair_rate/1e6:.3f}Mb/s "
+            f"elastic_flows={num_elastic_flows} "
+            f"priority_load={priority_load*100:.1f}% "
+            f"congested={self.is_congested} "
+            f"PFL={len(self.pfl)}"
         )
-
-        datapath.send_msg(mod)
-        self.logger_ramaf.info(f"[RAMAF] Reinstalled flow-table entry for {flow_key}")
-
-
-    def _delete_flow(self, flow_key):
-        dpid, src_ip, dst_ip, proto, src_port, dst_port = flow_key
-        if dpid not in self.datapaths:
-            return
-        datapath = self.datapaths[dpid]
-        parser = datapath.ofproto_parser
-        ofproto = datapath.ofproto
-
-        # Build match consistent with how we installed the flow
-        if proto == 6:
-            match = parser.OFPMatch(
-                eth_type=ether_types.ETH_TYPE_IP,
-                ipv4_src=src_ip,
-                ipv4_dst=dst_ip,
-                ip_proto=6,
-                tcp_src=src_port,
-                tcp_dst=dst_port
-            )
-        elif proto == 17:
-            match = parser.OFPMatch(
-                eth_type=ether_types.ETH_TYPE_IP,
-                ipv4_src=src_ip,
-                ipv4_dst=dst_ip,
-                ip_proto=17,
-                udp_src=src_port,
-                udp_dst=dst_port
-            )
-        else:
-            match = parser.OFPMatch(
-                eth_type=ether_types.ETH_TYPE_IP,
-                ipv4_src=src_ip,
-                ipv4_dst=dst_ip,
-                ip_proto=proto
-            )
-
-        mod = parser.OFPFlowMod(
-            datapath=datapath,
-            command=ofproto.OFPFC_DELETE,
-            out_port=ofproto.OFPP_ANY,
-            out_group=ofproto.OFPG_ANY,
-            match=match
-        )
-        datapath.send_msg(mod)
-        self.logger.info(f"[DPID {dpid}] Sent FlowMod(DELETE) for {src_ip}:{src_port} -> {dst_ip}:{dst_port}")
 
     # ----------------- Pending packets after ARP -----------------
     def _process_pending_packets(self, datapath, resolved_ip):

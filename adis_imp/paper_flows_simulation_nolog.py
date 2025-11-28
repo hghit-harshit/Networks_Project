@@ -14,7 +14,7 @@ err = wireless packet error rate on R2->D2 link (0.0001 to 0.1)
 
 
 
-def main(net, load="low", err=0.0001):
+def main(net, load="low", err=0.0001, cont_type = ""):
     import time
     import numpy as np
     import random
@@ -26,9 +26,9 @@ def main(net, load="low", err=0.0001):
 
     # 400 elastic flows: S1=160, S2=80, S3=40, S4=20
     ELASTIC_COUNTS = {
-        "s1": 10,
-        "s2": 10,
-        "s3": 10,
+        "s1": 40,
+        "s2": 30,
+        "s3": 20,
         "s4": 10
     }
 
@@ -117,7 +117,7 @@ def main(net, load="low", err=0.0001):
     # --------------------------
     print("Starting long-lived elastic flow S4 -> D2")
     s4 = net.get("s4")
-    s4.cmd(f"iperf -c {D2[0]} -p {D2[1]} -t {SIM_DURATION} > long_s4_d2.log 2>&1 &")
+    s4.cmd(f"iperf -c {D2[0]} -p {D2[1]} -t {SIM_DURATION} -i 1 > long_s4_d2_{err}_{load}_{cont_type}.log 2>&1 &")
 
     # --------------------------
     # STREAMING (20 UDP @80kbps)
@@ -190,61 +190,9 @@ def main(net, load="low", err=0.0001):
 
         flow_offset += count
     
-    # For each sender S1..S4
-    # for src, count in ELASTIC_COUNTS.items():
-
-    #     for _ in range(count):
-    #         if time.time() - start_time > SIM_DURATION:
-    #             print("Simulation time done. Stopping flow creation.")
-    #             break
-
-    #         wait = exp_wait(INTER[src])
-    #         size_bytes = pareto_bytes()
-
-    #         dur = max(1, int(size_bytes / (12_500_000)))  # 100 Mbps bottleneck = 12.5MB/s
-
-    #         sender = net.get(src)
-
-    #         print(f"[Elastic {flow_id}] {src} → D1 wait={wait:.3f}s size={size_bytes/1e6:.2f}MB dur≈{dur}s")
-    #         time.sleep(wait)
-
-    #         sender.cmd(
-    #             f"iperf -c {D1[0]} -p {D1[1]} -n {size_bytes} "
-    #             #f"> elastic_{flow_id}.log 2>&1 &"
-    #         )
-
-    #         flow_id += 1
 
     print("\n========== ALL FLOWS SCHEDULED ==========\n")
 
 
 
-# import threading
-# import time
-# import numpy as np
-# import random
 
-
-
-
-# def main(net):
-#     start_time = time.time()
-
-#     # Example config
-#     ELASTIC_COUNTS = {"s1":160, "s2":80, "s3":40, "s4":20}
-#     INTER = {"s1":0.4, "s2":0.3, "s3":0.2, "s4":0.1}
-#     SIM_DURATION = 300
-#     D1 = ("10.0.10.10", 5001)
-
-#     threads = []
-    
-
-#     # start all traffic generators simultaneously
-#     for t in threads:
-#         t.start()
-
-#     # wait for all to finish
-#     for t in threads:
-#         t.join()
-
-#     print("All elastic flows completed.")

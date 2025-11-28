@@ -1,0 +1,19 @@
+2025-11-25 09:55:23,363 - ryu.base.app_manager - INFO - loading app ryu.controller.ofp_handler
+2025-11-25 09:55:23,364 - ryu.base.app_manager - INFO - instantiating app new_cont.py of FANController
+2025-11-25 09:55:23,364 - ryu.base.app_manager - INFO - instantiating app ryu.controller.ofp_handler of OFPHandler
+2025-11-25 09:56:27,236 - FANController - INFO - [DPID 1] Switch connected
+2025-11-25 09:56:27,236 - ryu.base.app_manager - ERROR - FANController: Exception occurred during handler processing. Backtrace from offending handler [switch_features_handler] servicing event [EventOFPSwitchFeatures] follows.
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.8/dist-packages/ryu/base/app_manager.py", line 290, in _event_loop
+    handler(ev)
+  File "/media/sf_shared_folder/adis_imp/new_cont.py", line 137, in switch_features_handler
+    self.datapaths[dpid] = datapath
+AttributeError: 'FANController' object has no attribute 'datapaths'
+2025-11-25 09:56:27,315 - FANController - INFO - [DPID 2] Switch connected
+2025-11-25 09:56:27,315 - ryu.base.app_manager - ERROR - FANController: Exception occurred during handler processing. Backtrace from offending handler [switch_features_handler] servicing event [EventOFPSwitchFeatures] follows.
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.8/dist-packages/ryu/base/app_manager.py", line 290, in _event_loop
+    handler(ev)
+  File "/media/sf_shared_folder/adis_imp/new_cont.py", line 137, in switch_features_handler
+    self.datapaths[dpid] = datapath
+AttributeError: 'FANController' object has no attribute 'datapaths'

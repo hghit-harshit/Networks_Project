@@ -11,7 +11,17 @@ so each TCP/UDP connection is a separate flow for MBAC / RAMAF.
 # remove 1 flow in analysize stats 
 # readmission policy is 
 # if no congestion -> remove fifo from pafl
- 
+import logging
+import sys
+
+logging.basicConfig(
+    filename="controller.log",
+    filemode="w",
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    force=True
+)
+
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
@@ -21,27 +31,16 @@ from ryu.lib.packet import packet, ethernet, ipv4, arp, ether_types, icmp, tcp, 
 from ryu.lib import hub
 import time
 from collections import defaultdict
-import logging
+import csv
+import os
 
 class FANController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
-    def __init__(self, *args, **kwargs):
-        super(FANController, self).__init__(*args, **kwargs)
-
+    def _init_(self, *args, **kwargs):
+        super(FANController, self)._init_(*args, **kwargs)
         
-        self.logger_ramaf = logging.getLogger("ramaf")
-        self.logger_ramaf.setLevel(logging.INFO)
-        
-        fh_ramaf = logging.FileHandler("ramaf.log", mode="a")
-        fh_ramaf.setLevel(logging.INFO)
-        ramaf_formatter = logging.Formatter("%(asctime)s - %(message)s")
-        fh_ramaf.setFormatter(ramaf_formatter)
-        self.logger_ramaf.addHandler(fh_ramaf)
-        
-        #self.logger_ramaf.info("does this even work")
         # FAIR-RAW dedicated logger
-        
         self.fair_logger = logging.getLogger("fair_raw")
         self.fair_logger.setLevel(logging.INFO)
 
@@ -61,7 +60,18 @@ class FANController(app_manager.RyuApp):
         )
         fh.setFormatter(formatter)
         self.logger.addHandler(fh)
-        
+
+        # self.metrics_csv = "/tmp/fan_metrics.csv"
+        # if not os.path.exists(self.metrics_csv):
+        #     try:
+        #         with open(self.metrics_csv, "w") as f:
+        #             writer = csv.writer(f)
+        #             writer.writerow(["ts", "fair_rate_Mbps"])
+        #     except Exception:
+        #         # avoid crashing controller startup if filesystem problems occur
+        #         self.logger.exception("Failed to create metrics CSV header")
+
+
         # Router configuration
         self.router_interfaces = {
             1: {  # R1
@@ -98,8 +108,6 @@ class FANController(app_manager.RyuApp):
                 "10.0.4.0/24": (1, "10.0.5.1"),
             }
         }
-        
-        #self.routing_table = {}
 
         # L2/L3 helpers
         self.arp_table = {}
@@ -129,7 +137,7 @@ class FANController(app_manager.RyuApp):
         self.HARD_TIMEOUT = 0
         self.MAX_FLOWS_PER_USER = 2
         self.CONGESTION_THRESHOLD = 1.10
-        self.EVICTION_MARGIN = 1.20
+        self.EVICTION_MARGIN = 1.2
         self.BOTTLENECK_DPID = 1  # R1 enforces admission
 
         self.logger.info("=" * 70)
@@ -160,18 +168,10 @@ class FANController(app_manager.RyuApp):
             self.logger.info(f"[DPID {dpid}] Router interfaces:")
             for port, (ip, mac, net) in self.router_interfaces[dpid].items():
                 self.logger.info(f"  Port {port}: {ip} ({mac}) - Network {net}")
-        
 
-         #ADD ARP RULE HERE
-        # arp_match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_ARP)
-        # arp_actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
-        #                                     ofproto.OFPCML_NO_BUFFER)]
-        # self.add_flow(datapath,10, arp_match, arp_actions)
-
-        # EXISTING TABLE-MISS RULE
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
-                                        ofproto.OFPCML_NO_BUFFER)]
+                                         ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions)
 
     # ----------------- Packet-in handler -----------------
@@ -191,12 +191,10 @@ class FANController(app_manager.RyuApp):
             return
 
         if eth.ethertype == ether_types.ETH_TYPE_ARP:
-            self.logger.info("= *" * 10 + "\nARP Packet Received\n" + "= *" * 10)
             self._handle_arp(datapath, pkt, eth, in_port)
             return
-    
+
         if eth.ethertype == ether_types.ETH_TYPE_IP:
-            self.logger.info("= *" * 10 + "\nIPv4 Packet Received\n" + "= *" * 10)
             self._handle_ipv4_with_mbac(datapath, pkt, eth, in_port)
             return
 
@@ -204,11 +202,10 @@ class FANController(app_manager.RyuApp):
     def _handle_arp(self, datapath, pkt, eth, in_port):
         dpid = datapath.id
         arp_pkt = pkt.get_protocol(arp.arp)
-        self.logger.info(f"[DPID {dpid}] Handling ARP packet: opcode={arp_pkt.opcode} src_ip={arp_pkt.src_ip} dst_ip={arp_pkt.dst_ip}")
         if not arp_pkt:
             return
         self.arp_table[dpid][arp_pkt.src_ip] = arp_pkt.src_mac
-        self.logger.info(f"[DPID {dpid}] ARP learned: {arp_pkt.src_ip} -> {arp_pkt.src_mac}")
+        self.logger.debug(f"[DPID {dpid}] ARP learned: {arp_pkt.src_ip} -> {arp_pkt.src_mac}")
         self._process_pending_packets(datapath, arp_pkt.src_ip)
 
         if arp_pkt.opcode == arp.ARP_REQUEST:
@@ -219,7 +216,7 @@ class FANController(app_manager.RyuApp):
                         return
 
         elif arp_pkt.opcode == arp.ARP_REPLY:
-            self.logger.info(f"[DPID {dpid}] ARP reply: {arp_pkt.src_ip} is at {arp_pkt.src_mac}")
+            self.logger.debug(f"[DPID {dpid}] ARP reply: {arp_pkt.src_ip} is at {arp_pkt.src_mac}")
 
     def _send_arp_reply(self, datapath, arp_req, src_mac, out_port):
         ofproto = datapath.ofproto
@@ -497,10 +494,11 @@ class FANController(app_manager.RyuApp):
                     # UDP -> protected queue (0)
                     queue_id = 0
 
-        if proto == 6:
-            dscp_value = 0
+        # Mark streaming (UDP) as EF (DSCP 46), leave elastic (TCP) as BE (DSCP 0)
+        if proto == 17:
+            dscp_value = 46   # EF for streaming
         else:
-            dscp_value = 46
+            dscp_value = 0    # BE for elastic
 
         actions = [
             parser.OFPActionSetField(ip_dscp=dscp_value),
@@ -725,7 +723,6 @@ class FANController(app_manager.RyuApp):
         # ----- RAMAF eviction when congested
         if self.is_congested:
             evicted_count = 0
-            self.logger_ramaf.info(f"[RAMAF] Congested: fair_rate={self.fair_rate/1e6:.2f}Mbps priority_load={priority_load:.2f}")
             # iterate over the elastic flows we considered earlier and evict those exceeding threshold
             for flow_key in list(elastic_flow_keys):
                 stats = self.flow_stats.get(flow_key)
@@ -741,7 +738,7 @@ class FANController(app_manager.RyuApp):
 
                 # eviction threshold: rate > EVICTION_MARGIN * fair_rate
                 if rate_bps > self.EVICTION_MARGIN * self.fair_rate:
-                    self.logger_ramaf.info(
+                    self.logger.info(
                         f"[RAMAF] Evicting {flow_key} rate={rate_bps/1e6:.2f}Mbps "
                         f"(> {self.EVICTION_MARGIN*self.fair_rate/1e6:.2f}Mbps)"
                     )
@@ -765,7 +762,7 @@ class FANController(app_manager.RyuApp):
 
                     evicted_count += 1
 
-            self.logger_ramaf.info(f"[RAMAF] Congested -> evicted {evicted_count} flows")
+            self.logger.info(f"[RAMAF] Congested -> evicted {evicted_count} flows")
         else:
             # ----- RE-ADMIT when not congested
             if len(self.pafl) > 0:
@@ -783,7 +780,7 @@ class FANController(app_manager.RyuApp):
                 except Exception as e:
                     self.logger.exception(f"[RAMAF] Error reinstalling flow {readmit_flow}: {e}")
 
-                self.logger_ramaf.info(f"[RAMAF] Network healthy -> re-admitted flow {readmit_flow}")
+                self.logger.info(f"[RAMAF] Network healthy -> re-admitted flow {readmit_flow}")
 
         # ----- Snapshot current stats for next interval (must happen AFTER eviction/readmit)
         # Keep a shallow copy of counters/metadata used in the next window's delta computation.
@@ -797,17 +794,25 @@ class FANController(app_manager.RyuApp):
 
         # ----- Reset admitted counters for next window (paper semantics)
         self.admitted_flows_number = defaultdict(int)
+                # Write fair_rate to CSV each interval
+        try:
+            with open(self.metrics_csv, "a") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    time.time(),             # timestamp
+                    self.fair_rate / 1e6    # Mbps
+                ])
+        except Exception as e:
+            self.logger.error(f"Failed to write CSV: {e}")
 
         # final logging
-        # self.logger.info(
-        #     f"[FAN] fair_rate={self.fair_rate/1e6:.3f}Mbps "
-        #     f"elastic_flows={num_elastic_flows} "
-        #     f"priority_load={priority_load*100:.1f}% "
-        #     f"congested={self.is_congested} "
-        #     f"PFL={len(self.pfl)} PAFL={len(self.pafl)}"
-        # )
-        
-        
+        self.logger.info(
+            f"[FAN] fair_rate={self.fair_rate/1e6:.3f}Mbps "
+            f"elastic_flows={num_elastic_flows} "
+            f"priority_load={priority_load*100:.1f}% "
+            f"congested={self.is_congested} "
+            f"PFL={len(self.pfl)} PAFL={len(self.pafl)}"
+        )
 
     def _reinstall_flow(self, flow_key):
         dpid, src_ip, dst_ip, proto, sp, dp = flow_key
@@ -850,7 +855,7 @@ class FANController(app_manager.RyuApp):
         # Build match
         if proto == 6:
             match = parser.OFPMatch(
-                eth_type=0x0800,
+                eth_type=0x0800,    
                 ipv4_src=src_ip,
                 ipv4_dst=dst_ip,
                 ip_proto=6,
@@ -886,6 +891,7 @@ class FANController(app_manager.RyuApp):
             parser.OFPActionOutput(out_port)
         ]
 
+
         mod = parser.OFPFlowMod(
             datapath=datapath,
             priority=10,
@@ -896,7 +902,7 @@ class FANController(app_manager.RyuApp):
         )
 
         datapath.send_msg(mod)
-        self.logger_ramaf.info(f"[RAMAF] Reinstalled flow-table entry for {flow_key}")
+        self.logger.info(f"[RAMAF] Reinstalled flow-table entry for {flow_key}")
 
 
     def _delete_flow(self, flow_key):
