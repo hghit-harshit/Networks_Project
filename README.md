@@ -4,86 +4,52 @@ This repo implements a Flow-Aware Networking (FAN) controller in Ryu with a new 
 
 Per User Fairness in Flow-Aware Networks — Domżał, Wójcik, Jajszczyk (IEEE, 2012)
 
-It also provides Mininet experiment scripts to reproduce key simulation scenarios and generate graphs similar to the paper: efficiency vs wireless loss and waiting times for streaming flows, comparing a basic FAN admission vs per-user fairness with RAMAF.
+It also provides Mininet experiment scripts to reproduce key simulation scenarios and generate graphs similar to the paper: efficiency vs wireless loss and fair_rate vs time.
 
-Note: Reproducing the TCP NewJersey results requires kernel changes not available by default. This repo focuses on TCP NewReno and provides an ECN-based approximation option for the “NewJersey” curves. See limitations below.
 
-## Components
-- `ryu_app/fair_fan.py`: Ryu controller implementing:
-  - Measurement-Based Admission Control (MBAC)
-  - New fair-rate estimator (bytes per elastic flow) with smoothing
-  - Priority load estimation
-  - Per-user fairness limiter (max new flows per source per interval)
-  - RAMAF (remove most active flows) mechanism
-  - Learning-switch forwarding, optional OVS QoS queues for priority traffic
-- `mininet/topo_fig2.py`: Minimal FAN link topology (Fig. 2 analogue)
-- `mininet/topo_fig4.py`: FAN with a constrained “wireless” link (Fig. 4 analogue)
-- `experiments/run_experiments.py`: Automates experiments: launches Ryu, starts Mininet, generates elastic + streaming flows, sweeps wireless loss and load levels, collects CSVs
-- `experiments/plot_results.py`: Generates efficiency and waiting time graphs from CSVs
+## Building and Runings Experiments
 
-## Quick Start (Linux/WSL2 Ubuntu recommended)
+To build run the test you first have to install the following dependencies:
+(it is recommended to run this setup in a seperate vm)
+- mininet 
+- Ryu controller
 
-1) Install dependencies
-
-- System packages (Ubuntu):
-```
-sudo apt update
-sudo apt install -y python3-pip python3-ryu mininet openvswitch-switch iproute2 iperf3 tcpdump
-```
-- Python packages:
-```
-pip3 install -r requirements.txt
+Then to run first do the project directory and run this comman
+```bash
+ryu-manager fan_controller.py
 ```
 
-2) Start the controller (terminal 1)
+after this open a new terminal and start mininet cli using the command:
+```bash
+sudo python3 topo.py
 ```
-ryu-manager ryu_app/fair_fan.py --ofp-tcp-listen-port 6653 \
-  --fair.enable=true --fair.per_interval_limit=1 --fair.alpha=0.1 \
-  --fair.min_fair_rate_frac=0.05 --fair.max_priority_load_frac=0.7 \
-  --ramaf.enable=true --ramaf.interval=0.5 --ramaf.max_remove=10
+This will setup the topology and open a mininet cli, now inside the cli run the following commands
+```bash
+mininet > py exec(open('paper_flows_simulation_nolog.py').read())
+mininet > py main(net,load="high", err=0.01,)
 ```
+The logs of the expeirment will be over-written in fair_raw.log, controller.log and ramaf.log
 
-3) Run experiments (terminal 2)
-
-- Figure 4 analogue and efficiency plots (NewReno):
+Now run this experimet for each loss value, youll have to change the loss values in the topo.py code :
+```python
+net.addLink(r2, d2, cls=TCLink, bw=5, delay='5ms', loss=0.01)
 ```
-python3 experiments/run_experiments.py --scenario fig4 --controller 127.0.0.1:6653 \
-  --loss_sweep 0.0001 0.001 0.01 0.1 --duration 300 \
-  --load low high --mode basic fair
-```
-- Generate graphs:
-```
-python3 experiments/plot_results.py --input data/fig4 --output plots
-```
+Repeat experiment for loss
+- 10
+- 1
+- 0.1
+- 0.001
 
-Outputs are written under `data/` and `plots/`.
+Perform all test for
+- fan_controller
+-  normal_controller
 
-## Windows notes
-- Use WSL2 Ubuntu for Mininet/Ryu. On Windows PowerShell:
-```
-wsl --install -d Ubuntu
-wsl
-sudo apt update; sudo apt install -y mininet ryu-tool iperf3 python3-pip
-pip3 install -r /mnt/d/shared_folder/requirements.txt
-```
-- Run commands from within WSL where OVS/Mininet are available. Paths under Windows are mounted at `/mnt/d/shared_folder`.
+and for both 
+- high load
+- low load
 
-## Limitations / Differences
-- PFQ vs PDRR: This controller uses OVS with two queues (priority vs elastic) and learning-switch forwarding, approximating priority scheduling. Full PFQ/PDRR packet schedulers aren’t reimplemented in software; we emulate priority via OVS QoS.
-- TCP NewJersey: Not available in standard Linux. We provide an optional ECN-based approximation. Graphs labeled “NewJersey” can be generated in “ecn-approx” mode and are identified as such in legends.
-- Wireless link: We emulate via Mininet TCLink with `bw=5` and `netem loss` for specified loss rates.
+This results in around **180 Minutes** of total experiment.
+Additionally, the fair rate vs time graphs uses data collected over 15 minutes.
 
-## Repo Structure
-- `ryu_app/` — Ryu controller
-- `mininet/` — Topology scripts
-- `experiments/` — Automation + plotting
-- `data/` — Collected CSVs
-- `plots/` — Generated figures
-
-## Next Steps
-- Add queue occupancy feedback for RAMAF K estimation
-- Integrate Mininet-WiFi when available
-- Extend to per-port fair-rate accounting and multi-bottleneck paths
-
-## Citation
-If you use this work, please cite the original paper and reference this implementation.
+---
+Once these runs are complete, you will have all the required logs to generate the graphs.

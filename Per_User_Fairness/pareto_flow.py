@@ -1,21 +1,12 @@
 #!/usr/bin/env python3
-"""
-Pareto Traffic Generator for FAN Topology
-Run this *inside* Mininet CLI:
 
-    py pareto_flows.py
-
-or:
-
-    python3 pareto_flows.py
-"""
 
 def main(net):
     
     import time
     import numpy as np
     import random
-    #net = globals()['net']   # ACCESS THE REAL MININET OBJECT
+    #net = globals()['net']   
     ALPHA = 1.5             # Pareto shape
     SCALE = 0.8             # Minimum wait
     NUM_FLOWS = 60          # Number of flows
